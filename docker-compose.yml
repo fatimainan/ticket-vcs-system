@@ -1,0 +1,81 @@
+networks:
+  ticketvcs-net:
+    driver: bridge
+
+volumes:
+  user-data:
+  ticket-data:
+  vcs-data:
+
+services:
+  # ──────────────────────────────────────────────────────────────
+  # USER SERVICE  (port 8001)
+  # ──────────────────────────────────────────────────────────────
+  user-service:
+    build:
+      context: ./user-service
+    container_name: user-service
+    ports:
+      - "8001:8001"
+    volumes:
+      - user-data:/data
+    networks:
+      - ticketvcs-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────────
+  # TICKET SERVICE  (port 8002)
+  # ──────────────────────────────────────────────────────────────
+  ticket-service:
+    build:
+      context: ./ticket-service
+    container_name: ticket-service
+    ports:
+      - "8002:8002"
+    volumes:
+      - ticket-data:/data
+    environment:
+      - VCS_SERVICE_URL=http://vcs-service:8003
+      - USER_SERVICE_URL=http://user-service:8001
+    networks:
+      - ticketvcs-net
+    depends_on:
+      user-service:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────────
+  # VERSION CONTROL SERVICE  (port 8003)
+  # ──────────────────────────────────────────────────────────────
+  vcs-service:
+    build:
+      context: ./vcs-service
+    container_name: vcs-service
+    ports:
+      - "8003:8003"
+    volumes:
+      - vcs-data:/data
+    environment:
+      - TICKET_SERVICE_URL=http://ticket-service:8002
+      - USER_SERVICE_URL=http://user-service:8001
+    networks:
+      - ticketvcs-net
+    depends_on:
+      ticket-service:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

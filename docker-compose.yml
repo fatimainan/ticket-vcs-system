@@ -45,8 +45,7 @@ services:
     networks:
       - ticketvcs-net
     depends_on:
-      user-service:
-        condition: service_healthy
+      - user-service
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
@@ -71,8 +70,8 @@ services:
     networks:
       - ticketvcs-net
     depends_on:
-      ticket-service:
-        condition: service_healthy
+      - user-service
+      - ticket-service
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]

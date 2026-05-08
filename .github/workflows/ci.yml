@@ -15,7 +15,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
       - name: Install Flake8
         run: pip install flake8
       - name: Run Flake8 Linter
@@ -43,16 +43,19 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
       - name: Start Services
         run: |
           docker-compose up -d --build
           sleep 20
+
       - name: Check Health Endpoints
         run: |
           curl -f http://localhost:8001/health || exit 1
           curl -f http://localhost:8002/health || exit 1
           curl -f http://localhost:8003/health || exit 1
           echo "All services healthy"
+
       - name: Test Full Integration Flow
         run: |
           USER=$(curl -s -X POST http://localhost:8001/users -H "Content-Type: application/json" -d '{"username":"ci_user","email":"ci@test.com","full_name":"CI User","role":"developer"}')
@@ -68,6 +71,7 @@ jobs:
           DONE=$(curl -s -X PUT "http://localhost:8002/tickets/$TICKET_ID" -H "Content-Type: application/json" -d '{"status":"DONE"}')
           echo "Done: $DONE"
           echo $DONE | grep -q '"status":"DONE"' && echo "Integration test PASSED" || (echo "FAILED" && exit 1)
+
       - name: Cleanup
         if: always()
         run: |

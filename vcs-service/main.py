@@ -4,13 +4,14 @@ from typing import Optional, List
 import sqlite3
 import uuid
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 import os
+import time
 
 app = FastAPI(
     title="Version Control Service",
-    version="1.0.0",
+    version="1.1.0",
     description="Simulates Git-like commits. Every commit MUST be linked to a Ticket ID."
 )
 
@@ -69,7 +70,7 @@ init_db()
 
 class CommitCreate(BaseModel):
     message: str
-    ticket_id: str                       # MANDATORY – every commit needs a ticket
+    ticket_id: str
     author_id: str
     branch: str = "main"
     repository: str = "default-repo"
@@ -99,9 +100,41 @@ class BranchCreate(BaseModel):
     author_id: str
 
 
+# ─── Retry Utility ───────────────────────────────────────────────────────────
+
+def httpx_get_with_retry(url: str, max_retries: int = 5, delay: float = 2.0):
+    """HTTP GET with retry for service startup resilience."""
+    for attempt in range(max_retries):
+        try:
+            response = httpx.get(url, timeout=5.0)
+            return response
+        except httpx.RequestError:
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                raise
+    return None
+
+
+def validate_user_exists(user_id: str):
+    """Check if a user exists in the User Service."""
+    try:
+        r = httpx.get(f"{USER_SERVICE_URL}/users/{user_id}", timeout=5.0)
+        if r.status_code == 404:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Author '{user_id}' does not exist in User Service"
+            )
+    except httpx.RequestError:
+        # If user service is down, allow but warn
+        pass
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "vcs-service"}
+    return {"status": "healthy", "service": "vcs-service", "version": "1.1.0"}
 
 
 @app.post("/commits", response_model=CommitResponse, status_code=201)
@@ -123,9 +156,16 @@ def create_commit(commit: CommitCreate):
     if not commit.message or len(commit.message.strip()) < 5:
         raise HTTPException(status_code=400, detail="Commit message must be at least 5 characters.")
 
+    # Validate author exists
+    validate_user_exists(commit.author_id)
+
     # Validate ticket exists in Ticket Service
     try:
-        r = httpx.get(f"{TICKET_SERVICE_URL}/tickets/{commit.ticket_id}", timeout=5.0)
+        r = httpx_get_with_retry(
+            f"{TICKET_SERVICE_URL}/tickets/{commit.ticket_id}",
+            max_retries=3,
+            delay=1.0
+        )
         if r.status_code == 404:
             raise HTTPException(
                 status_code=404,
@@ -140,7 +180,7 @@ def create_commit(commit: CommitCreate):
     except httpx.RequestError:
         raise HTTPException(status_code=503, detail="Ticket Service is unreachable. Cannot validate ticket.")
 
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     full_hash = generate_commit_hash(commit.message, commit.author_id, now)
     short_hash = full_hash[:7]
 
@@ -167,8 +207,13 @@ def create_commit(commit: CommitCreate):
 
 
 @app.get("/commits", response_model=List[CommitResponse])
-def list_commits(repository: Optional[str] = None, branch: Optional[str] = None,
-                 author_id: Optional[str] = None, limit: int = 50):
+def list_commits(
+    repository: Optional[str] = None,
+    branch: Optional[str] = None,
+    author_id: Optional[str] = None,
+    ticket_id: Optional[str] = None,
+    limit: int = 50
+):
     conn = get_db()
     query = "SELECT * FROM commits WHERE 1=1"
     params = []
@@ -181,7 +226,10 @@ def list_commits(repository: Optional[str] = None, branch: Optional[str] = None,
     if author_id:
         query += " AND author_id=?"
         params.append(author_id)
-    query += f" ORDER BY timestamp DESC LIMIT ?"
+    if ticket_id:
+        query += " AND ticket_id=?"
+        params.append(ticket_id)
+    query += " ORDER BY timestamp DESC LIMIT ?"
     params.append(limit)
     rows = conn.execute(query, params).fetchall()
     conn.close()
@@ -202,7 +250,6 @@ def get_commits_by_ticket(ticket_id: str):
 @app.get("/commits/{commit_id}", response_model=CommitResponse)
 def get_commit(commit_id: str):
     conn = get_db()
-    # Support both full hash and short hash lookup
     row = conn.execute(
         "SELECT * FROM commits WHERE commit_id=? OR short_hash=?", (commit_id, commit_id)
     ).fetchone()
@@ -210,6 +257,19 @@ def get_commit(commit_id: str):
     if not row:
         raise HTTPException(status_code=404, detail=f"Commit '{commit_id}' not found")
     return dict(row)
+
+
+@app.delete("/commits/{commit_id}", status_code=204)
+def delete_commit(commit_id: str):
+    """Delete a commit by its full or short hash."""
+    conn = get_db()
+    result = conn.execute(
+        "DELETE FROM commits WHERE commit_id=? OR short_hash=?", (commit_id, commit_id)
+    )
+    conn.commit()
+    conn.close()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail=f"Commit '{commit_id}' not found")
 
 
 @app.get("/commits/{commit_id}/ticket")
@@ -226,7 +286,11 @@ def get_commit_ticket(commit_id: str):
     ticket_id = commit_data["ticket_id"]
 
     try:
-        r = httpx.get(f"{TICKET_SERVICE_URL}/tickets/{ticket_id}", timeout=5.0)
+        r = httpx_get_with_retry(
+            f"{TICKET_SERVICE_URL}/tickets/{ticket_id}",
+            max_retries=3,
+            delay=1.0
+        )
         if r.status_code == 200:
             return {
                 "commit_id": commit_data["commit_id"],
@@ -253,8 +317,11 @@ def get_commit_ticket(commit_id: str):
 
 @app.post("/branches", status_code=201)
 def create_branch(branch: BranchCreate):
+    # Validate author
+    validate_user_exists(branch.author_id)
+    
     branch_id = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     conn = get_db()
     try:
         conn.execute(
@@ -266,8 +333,14 @@ def create_branch(branch: BranchCreate):
         raise HTTPException(status_code=409, detail=f"Branch '{branch.name}' already exists in '{branch.repository}'")
     finally:
         conn.close()
-    return {"id": branch_id, "name": branch.name, "repository": branch.repository,
-            "created_from": branch.created_from, "author_id": branch.author_id, "created_at": now}
+    return {
+        "id": branch_id,
+        "name": branch.name,
+        "repository": branch.repository,
+        "created_from": branch.created_from,
+        "author_id": branch.author_id,
+        "created_at": now
+    }
 
 
 @app.get("/branches")
@@ -279,6 +352,17 @@ def list_branches(repository: Optional[str] = None):
         rows = conn.execute("SELECT * FROM branches").fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+@app.delete("/branches/{branch_id}", status_code=204)
+def delete_branch(branch_id: str):
+    """Delete a branch by its ID."""
+    conn = get_db()
+    result = conn.execute("DELETE FROM branches WHERE id=?", (branch_id,))
+    conn.commit()
+    conn.close()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail=f"Branch '{branch_id}' not found")
 
 
 # ─── Repository Stats ─────────────────────────────────────────────────────────
@@ -299,8 +383,17 @@ def get_repo_stats(repository: str):
     recent = conn.execute(
         "SELECT * FROM commits WHERE repository=? ORDER BY timestamp DESC LIMIT 5", (repository,)
     ).fetchall()
+    
+    # Get most active author
+    top_author = conn.execute(
+        """SELECT author_id, COUNT(*) as count FROM commits 
+           WHERE repository=? GROUP BY author_id ORDER BY count DESC LIMIT 1""",
+        (repository,)
+    ).fetchone()
+    
     conn.close()
-    return {
+    
+    result = {
         "repository": repository,
         "total_commits": total,
         "tickets_referenced": tickets,
@@ -308,3 +401,20 @@ def get_repo_stats(repository: str):
         "branch_count": branches_count,
         "recent_commits": [dict(r) for r in recent]
     }
+    
+    if top_author:
+        result["most_active_author"] = {
+            "author_id": top_author["author_id"],
+            "commit_count": top_author["count"]
+        }
+    
+    return result
+
+
+@app.get("/repositories")
+def list_repositories():
+    """List all unique repositories."""
+    conn = get_db()
+    rows = conn.execute("SELECT DISTINCT repository FROM commits").fetchall()
+    conn.close()
+    return [r["repository"] for r in rows]

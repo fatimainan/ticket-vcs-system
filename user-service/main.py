@@ -1,18 +1,27 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+import httpx
+import os
 
-app = FastAPI(title="User Service", version="1.0.0", description="Manages users for the Ticket-VCS Integration System")
+app = FastAPI(
+    title="User Service",
+    version="1.1.0",
+    description="Manages users for the Ticket-VCS Integration System"
+)
 
 DB_PATH = "/data/users.db"
+TICKET_SERVICE_URL = os.getenv("TICKET_SERVICE_URL", "http://ticket-service:8002")
+
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     import os
@@ -32,13 +41,15 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
+
 
 class UserCreate(BaseModel):
     username: str
     email: str
     full_name: str
-    role: str = "developer"  # developer | manager | qa
+    role: str = "developer"
 
 class UserUpdate(BaseModel):
     email: Optional[str] = None
@@ -54,17 +65,22 @@ class UserResponse(BaseModel):
     created_at: str
     updated_at: str
 
+
+VALID_ROLES = ["developer", "manager", "qa", "admin"]
+
+
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "user-service"}
+    return {"status": "healthy", "service": "user-service", "version": "1.1.0"}
+
 
 @app.post("/users", response_model=UserResponse, status_code=201)
 def create_user(user: UserCreate):
-    valid_roles = ["developer", "manager", "qa"]
-    if user.role not in valid_roles:
-        raise HTTPException(status_code=400, detail=f"Role must be one of: {valid_roles}")
+    if user.role not in VALID_ROLES:
+        raise HTTPException(status_code=400, detail=f"Role must be one of: {VALID_ROLES}")
+    
     user_id = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     conn = get_db()
     try:
         conn.execute(
@@ -76,18 +92,43 @@ def create_user(user: UserCreate):
         raise HTTPException(status_code=409, detail=f"Username or email already exists: {str(e)}")
     finally:
         conn.close()
-    return UserResponse(id=user_id, username=user.username, email=user.email,
-                        full_name=user.full_name, role=user.role, created_at=now, updated_at=now)
+    return UserResponse(
+        id=user_id, username=user.username, email=user.email,
+        full_name=user.full_name, role=user.role, created_at=now, updated_at=now
+    )
+
 
 @app.get("/users", response_model=List[UserResponse])
-def list_users(role: Optional[str] = None):
+def list_users(
+    role: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000)
+):
     conn = get_db()
     if role:
-        rows = conn.execute("SELECT * FROM users WHERE role=?", (role,)).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM users WHERE role=? LIMIT ? OFFSET ?",
+            (role, limit, skip)
+        ).fetchall()
     else:
-        rows = conn.execute("SELECT * FROM users").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM users LIMIT ? OFFSET ?",
+            (limit, skip)
+        ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+@app.get("/users/count")
+def get_user_count(role: Optional[str] = None):
+    conn = get_db()
+    if role:
+        count = conn.execute("SELECT COUNT(*) FROM users WHERE role=?", (role,)).fetchone()[0]
+    else:
+        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    conn.close()
+    return {"total_users": count, "role_filter": role}
+
 
 @app.get("/users/{user_id}", response_model=UserResponse)
 def get_user(user_id: str):
@@ -98,6 +139,7 @@ def get_user(user_id: str):
         raise HTTPException(status_code=404, detail="User not found")
     return dict(row)
 
+
 @app.get("/users/by-username/{username}", response_model=UserResponse)
 def get_user_by_username(username: str):
     conn = get_db()
@@ -107,6 +149,7 @@ def get_user_by_username(username: str):
         raise HTTPException(status_code=404, detail="User not found")
     return dict(row)
 
+
 @app.put("/users/{user_id}", response_model=UserResponse)
 def update_user(user_id: str, update: UserUpdate):
     conn = get_db()
@@ -114,16 +157,18 @@ def update_user(user_id: str, update: UserUpdate):
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="User not found")
-    now = datetime.utcnow().isoformat()
+    
+    now = datetime.now(timezone.utc).isoformat()
     fields = dict(row)
+    
     if update.email: fields["email"] = update.email
     if update.full_name: fields["full_name"] = update.full_name
     if update.role:
-        valid_roles = ["developer", "manager", "qa"]
-        if update.role not in valid_roles:
-            raise HTTPException(status_code=400, detail=f"Role must be one of: {valid_roles}")
+        if update.role not in VALID_ROLES:
+            raise HTTPException(status_code=400, detail=f"Role must be one of: {VALID_ROLES}")
         fields["role"] = update.role
     fields["updated_at"] = now
+    
     conn.execute(
         "UPDATE users SET email=?, full_name=?, role=?, updated_at=? WHERE id=?",
         (fields["email"], fields["full_name"], fields["role"], now, user_id)
@@ -131,6 +176,7 @@ def update_user(user_id: str, update: UserUpdate):
     conn.commit()
     conn.close()
     return fields
+
 
 @app.delete("/users/{user_id}", status_code=204)
 def delete_user(user_id: str):
@@ -140,3 +186,30 @@ def delete_user(user_id: str):
     conn.close()
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="User not found")
+
+
+@app.get("/users/{user_id}/tickets")
+def get_user_tickets(user_id: str, status: Optional[str] = None):
+    """Fetch tickets assigned to this user from Ticket Service."""
+    # First verify user exists
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    try:
+        url = f"{TICKET_SERVICE_URL}/tickets?assignee_id={user_id}"
+        if status:
+            url += f"&status={status}"
+        r = httpx.get(url, timeout=5.0)
+        if r.status_code == 200:
+            return {
+                "user_id": user_id,
+                "username": row["username"],
+                "tickets": r.json()
+            }
+        else:
+            raise HTTPException(status_code=502, detail="Could not fetch tickets from Ticket Service")
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="Ticket Service is unreachable")

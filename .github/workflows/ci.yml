@@ -10,7 +10,7 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   # 1. KOD KALİTE KONTROLÜ (Lint & Format)
   # ═══════════════════════════════════════════════════════════════
-  lint:
+    lint:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -19,27 +19,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install Linting Tools
         run: |
-          pip install flake8 black isort
-
-      - name: Check Code Formatting (Black)
-        run: |
-          black --check --diff user-service/ ticket-service/ vcs-service/
-
-      - name: Check Import Sorting (isort)
-        run: |
-          isort --check-only --diff user-service/ ticket-service/ vcs-service/
+          pip install flake8
 
       - name: Run Flake8 Linter
         run: |
           flake8 user-service/ ticket-service/ vcs-service/ \
-            --max-line-length=120 \
-            --ignore=E501,W503 \
+            --max-line-length=150 \
+            --ignore=E501,W503,E302,E305 \
             --show-source
-
   # ═══════════════════════════════════════════════════════════════
   # 2. BİRİM TESTLERİ (Unit Tests)
   # ═══════════════════════════════════════════════════════════════

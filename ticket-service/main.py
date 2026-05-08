@@ -3,13 +3,14 @@ from pydantic import BaseModel
 from typing import Optional, List
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 import os
+import time
 
 app = FastAPI(
     title="Ticket Service",
-    version="1.0.0",
+    version="1.1.0",
     description="Manages tickets with enforced Version Control integration (DONE requires a linked commit)"
 )
 
@@ -51,7 +52,7 @@ init_db()
 class TicketCreate(BaseModel):
     title: str
     description: Optional[str] = None
-    priority: str = "MEDIUM"      # LOW | MEDIUM | HIGH | CRITICAL
+    priority: str = "MEDIUM"
     assignee_id: Optional[str] = None
     reporter_id: Optional[str] = None
     project: str = "DEFAULT"
@@ -60,7 +61,7 @@ class TicketCreate(BaseModel):
 class TicketUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
-    status: Optional[str] = None  # OPEN | IN_PROGRESS | IN_REVIEW | DONE
+    status: Optional[str] = None
     priority: Optional[str] = None
     assignee_id: Optional[str] = None
     project: Optional[str] = None
@@ -83,9 +84,50 @@ VALID_STATUSES = ["OPEN", "IN_PROGRESS", "IN_REVIEW", "DONE"]
 VALID_PRIORITIES = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 
 
+# ─── Retry Utility ───────────────────────────────────────────────────────────
+
+def httpx_get_with_retry(url: str, max_retries: int = 5, delay: float = 2.0):
+    """HTTP GET with retry for service startup resilience."""
+    for attempt in range(max_retries):
+        try:
+            response = httpx.get(url, timeout=5.0)
+            return response
+        except httpx.RequestError:
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                raise
+    return None
+
+
+def validate_user_exists(user_id: str, field_name: str = "user"):
+    """
+    Check if a user exists in the User Service.
+    If User Service is down, skip validation (fail-open for resilience).
+    If User Service returns 404, raise error (user definitely doesn't exist).
+    """
+    if not user_id:
+        return
+    
+    try:
+        r = httpx.get(f"{USER_SERVICE_URL}/users/{user_id}", timeout=5.0)
+        if r.status_code == 404:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} '{user_id}' does not exist in User Service"
+            )
+        # 200 = OK, diğer kodlar = servis ayakta ama farklı durum, kabul et
+    except httpx.RequestError as e:
+        # User Service erişilemiyor - logla ama engelleme
+        print(f"WARNING: Cannot reach User Service to validate {field_name} '{user_id}': {e}")
+        # Fail-open: servis down ise validation atla
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "ticket-service"}
+    return {"status": "healthy", "service": "ticket-service", "version": "1.1.0"}
 
 
 @app.post("/tickets", response_model=TicketResponse, status_code=201)
@@ -93,8 +135,14 @@ def create_ticket(ticket: TicketCreate):
     if ticket.priority not in VALID_PRIORITIES:
         raise HTTPException(status_code=400, detail=f"Priority must be one of: {VALID_PRIORITIES}")
 
+    # Validate assignee and reporter if provided
+    if ticket.assignee_id:
+        validate_user_exists(ticket.assignee_id, "assignee")
+    if ticket.reporter_id:
+        validate_user_exists(ticket.reporter_id, "reporter")
+
     ticket_id = f"TICK-{str(uuid.uuid4())[:8].upper()}"
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     conn = get_db()
     conn.execute(
         """INSERT INTO tickets
@@ -114,8 +162,12 @@ def create_ticket(ticket: TicketCreate):
 
 
 @app.get("/tickets", response_model=List[TicketResponse])
-def list_tickets(status: Optional[str] = None, project: Optional[str] = None,
-                 assignee_id: Optional[str] = None):
+def list_tickets(
+    status: Optional[str] = None,
+    project: Optional[str] = None,
+    assignee_id: Optional[str] = None,
+    priority: Optional[str] = None
+):
     conn = get_db()
     query = "SELECT * FROM tickets WHERE 1=1"
     params = []
@@ -128,6 +180,9 @@ def list_tickets(status: Optional[str] = None, project: Optional[str] = None,
     if assignee_id:
         query += " AND assignee_id=?"
         params.append(assignee_id)
+    if priority:
+        query += " AND priority=?"
+        params.append(priority)
     query += " ORDER BY created_at DESC"
     rows = conn.execute(query, params).fetchall()
     conn.close()
@@ -153,12 +208,20 @@ def update_ticket(ticket_id: str, update: TicketUpdate):
         raise HTTPException(status_code=404, detail=f"Ticket '{ticket_id}' not found")
 
     fields = dict(row)
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Validate new assignee if provided
+    if update.assignee_id is not None and update.assignee_id != fields.get("assignee_id"):
+        validate_user_exists(update.assignee_id, "assignee")
 
     # ─── CORE BUSINESS RULE: Cannot mark DONE without a linked commit ───
     if update.status == "DONE":
         try:
-            response = httpx.get(f"{VCS_SERVICE_URL}/commits/by-ticket/{ticket_id}", timeout=5.0)
+            response = httpx_get_with_retry(
+                f"{VCS_SERVICE_URL}/commits/by-ticket/{ticket_id}",
+                max_retries=3,
+                delay=1.0
+            )
             if response.status_code == 200:
                 commits = response.json()
                 if len(commits) == 0:
@@ -178,7 +241,7 @@ def update_ticket(ticket_id: str, update: TicketUpdate):
             raise HTTPException(status_code=503, detail="VCS Service is unreachable. Cannot validate commit requirement.")
 
     if update.title: fields["title"] = update.title
-    if update.description: fields["description"] = update.description
+    if update.description is not None: fields["description"] = update.description
     if update.status:
         if update.status not in VALID_STATUSES:
             raise HTTPException(status_code=400, detail=f"Status must be one of: {VALID_STATUSES}")
@@ -220,7 +283,11 @@ def get_ticket_commits(ticket_id: str):
     if not row:
         raise HTTPException(status_code=404, detail=f"Ticket '{ticket_id}' not found")
     try:
-        response = httpx.get(f"{VCS_SERVICE_URL}/commits/by-ticket/{ticket_id}", timeout=5.0)
+        response = httpx_get_with_retry(
+            f"{VCS_SERVICE_URL}/commits/by-ticket/{ticket_id}",
+            max_retries=3,
+            delay=1.0
+        )
         commits = response.json()
         return {
             "ticket_id": ticket_id,
@@ -246,7 +313,11 @@ def get_ticket_summary(ticket_id: str):
 
     # Fetch commits
     try:
-        r = httpx.get(f"{VCS_SERVICE_URL}/commits/by-ticket/{ticket_id}", timeout=5.0)
+        r = httpx_get_with_retry(
+            f"{VCS_SERVICE_URL}/commits/by-ticket/{ticket_id}",
+            max_retries=3,
+            delay=1.0
+        )
         commits = r.json() if r.status_code == 200 else []
     except Exception:
         commits = []
@@ -261,9 +332,20 @@ def get_ticket_summary(ticket_id: str):
         except Exception:
             pass
 
+    # Fetch reporter info
+    reporter = None
+    if ticket_data.get("reporter_id"):
+        try:
+            r = httpx.get(f"{USER_SERVICE_URL}/users/{ticket_data['reporter_id']}", timeout=5.0)
+            if r.status_code == 200:
+                reporter = r.json()
+        except Exception:
+            pass
+
     return {
         "ticket": ticket_data,
         "assignee": assignee,
+        "reporter": reporter,
         "commits": commits,
         "commit_count": len(commits),
         "can_be_closed": len(commits) > 0
@@ -274,9 +356,35 @@ def get_ticket_summary(ticket_id: str):
 def get_project_stats(project: str):
     """Return ticket statistics per project."""
     conn = get_db()
-    rows = conn.execute("SELECT status, COUNT(*) as count FROM tickets WHERE project=? GROUP BY status", (project,)).fetchall()
+    rows = conn.execute(
+        "SELECT status, COUNT(*) as count FROM tickets WHERE project=? GROUP BY status", (project,)
+    ).fetchall()
     conn.close()
     stats = {s: 0 for s in VALID_STATUSES}
     for row in rows:
         stats[row["status"]] = row["count"]
     return {"project": project, "stats": stats, "total": sum(stats.values())}
+
+
+@app.get("/tickets/stats/global")
+def get_global_stats():
+    """Return global ticket statistics."""
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+    status_rows = conn.execute("SELECT status, COUNT(*) as count FROM tickets GROUP BY status").fetchall()
+    priority_rows = conn.execute("SELECT priority, COUNT(*) as count FROM tickets GROUP BY priority").fetchall()
+    conn.close()
+    
+    status_stats = {s: 0 for s in VALID_STATUSES}
+    for row in status_rows:
+        status_stats[row["status"]] = row["count"]
+    
+    priority_stats = {p: 0 for p in VALID_PRIORITIES}
+    for row in priority_rows:
+        priority_stats[row["priority"]] = row["count"]
+    
+    return {
+        "total_tickets": total,
+        "by_status": status_stats,
+        "by_priority": priority_stats
+    }
